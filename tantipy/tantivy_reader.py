@@ -1,8 +1,6 @@
 from typing import (
     Iterable,
-    Optional,
     Tuple,
-    Union,
 )
 
 import brotli
@@ -10,6 +8,13 @@ from izihawa_types.var import (
     process_varint,
     process_varstr,
 )
+
+from .tantivy_coder import TantivyCoder
+
+
+def auto_process_varint(data):
+    var, length = process_varint(data, inverted=True)
+    return var, data[length:]
 
 
 def read_footer(data: bytes) -> Tuple[bytes, bytes]:
@@ -19,55 +24,56 @@ def read_footer(data: bytes) -> Tuple[bytes, bytes]:
     return body, footer
 
 
-def read_store(body: bytes) -> Tuple[bytes, bytes, int]:
-    offset = int.from_bytes(body[-12:-4], 'little', signed=False)
-    max_doc = int.from_bytes(body[-4:], 'little', signed=False)
-    return body[:offset], body[offset:-12], max_doc
+def read_store(body: bytes) -> Tuple[bytes, bytes]:
+    offset = int.from_bytes(body[-8:], 'little', signed=False)
+    return body[:offset], body[offset:-8]
 
 
 def parse_footer(footer: bytes) -> Tuple[int, int, bytes]:
-    footer_length, length = process_varint(footer, inverted=True)
-    footer = footer[length:]
+    footer_length, footer = auto_process_varint(footer)
     version = int.from_bytes(footer[:4], 'little', signed=False)
     crc = int.from_bytes(footer[4:8], 'little', signed=False)
     compression, _ = process_varstr(footer[8:], inverted=True)
     return version, crc, compression
 
 
+def read_layers(skip_index):
+    layers = []
+    skip_index_length, skip_index = auto_process_varint(skip_index)
+    start_offset = 0
+    for i in range(skip_index_length):
+        end_offset, skip_index = auto_process_varint(skip_index)
+        layers.append((start_offset, end_offset))
+        start_offset = end_offset
+    return layers, skip_index
+
+
+def parse_blocks(last_layer):
+    checkpoints = []
+    while last_layer:
+        length, last_layer = auto_process_varint(last_layer)
+        if length == 0:
+            continue
+        doc_id, last_layer = auto_process_varint(last_layer)
+        start_offset, last_layer = auto_process_varint(last_layer)
+        for i in range(length):
+            num_docs, last_layer = auto_process_varint(last_layer)
+            block_num_bytes, last_layer = auto_process_varint(last_layer)
+            checkpoints.append({
+                'start_doc': doc_id,
+                'end_doc': doc_id + num_docs,
+                'start_offset': start_offset,
+                'end_offset': start_offset + block_num_bytes,
+            })
+            doc_id += num_docs
+            start_offset += block_num_bytes
+    return checkpoints
+
+
 class TantivyReader:
-    def __init__(self, store: bytes, schema: dict):
+    def __init__(self, store: bytes, coder: TantivyCoder):
         self.store = store
-        self.schema = schema
-
-    def _decode_document(self, reader: bytes) -> dict:
-        num_field_values, length = process_varint(reader, inverted=True)
-        reader = reader[length:]
-        document = {}
-        for _ in range(num_field_values):
-            field_id, value, reader = self._decode_field(reader)
-            if self.schema[field_id]['name'] not in document:
-                document[self.schema[field_id]['name']] = []
-            document[self.schema[field_id]['name']].append(value)
-        return document
-
-    def _decode_field(self, reader: bytes) -> Tuple[int, Union[Optional[bytes], int], bytes]:
-        field_id, length = process_varint(reader, inverted=True)
-        reader = reader[length:]
-        type_ = int.from_bytes(reader[:1], 'little', signed=False)
-        reader = reader[1:]
-        if type_ == 0:
-            value, length = process_varstr(reader, inverted=True)
-            value = value.decode()
-            reader = reader[length:]
-        elif type_ == 1:
-            value = int.from_bytes(reader[:8], 'little', signed=False)
-            reader = reader[8:]
-        elif type_ == 2:
-            value = int.from_bytes(reader[:8], 'little', signed=True)
-            reader = reader[8:]
-        else:
-            return field_id, None, reader
-        return field_id, value, reader
+        self.coder = coder
 
     def documents(self) -> Iterable[dict]:
         """
@@ -77,14 +83,15 @@ class TantivyReader:
             Document generator
         """
         body, footer = read_footer(self.store)
-        store, skip_list, max_doc = read_store(body)
-        while store:
-            block_size = int.from_bytes(store[:4], 'little', signed=False)
-            decompressed = brotli.decompress(store[4:block_size + 4])
+        store, skip_index = read_store(body)
+        layers, skip_index = read_layers(skip_index)
+
+        checkpoints = parse_blocks(skip_index[layers[-1][0]:layers[-1][1]])
+
+        for checkpoint in checkpoints:
+            decompressed = brotli.decompress(store[checkpoint['start_offset']:checkpoint['end_offset']])
             while decompressed:
-                doc_length, length = process_varint(decompressed, inverted=True)
-                decompressed = decompressed[length:]
-                document = self._decode_document(decompressed)
+                doc_length, decompressed = auto_process_varint(decompressed)
+                document = self.coder.decode_document(decompressed)
                 yield document
                 decompressed = decompressed[doc_length:]
-            store = store[block_size + 4:]
